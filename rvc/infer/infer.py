@@ -9,6 +9,8 @@ import traceback
 import numpy as np
 import soundfile as sf
 import noisereduce as nr
+import faiss
+import tempfile
 from pedalboard import (
     Pedalboard,
     Chorus,
@@ -61,6 +63,7 @@ class VoiceConverter:
         self.n_spk = None  # Number of speakers in the model
         self.use_f0 = None  # Whether the model uses F0
         self.loaded_model = None
+        self.serialized_index_data = None # Holds serialized index from .uvcp
 
     def load_hubert(self, embedder_model: str, embedder_model_custom: str = None):
         """
@@ -218,42 +221,26 @@ class VoiceConverter:
         sid: int = 0,
         **kwargs,
     ):
-        """
-        Performs voice conversion on the input audio.
-
-        Args:
-            pitch (int): Key for F0 up-sampling.
-            filter_radius (float): Radius for filtering.
-            index_rate (float): Rate for index matching.
-            volume_envelope (int): RMS mix rate.
-            protect (float): Protection rate for certain audio segments.
-            hop_length (int): Hop length for audio processing.
-            f0_method (str): Method for F0 extraction.
-            audio_input_path (str): Path to the input audio file.
-            audio_output_path (str): Path to the output audio file.
-            model_path (str): Path to the voice conversion model.
-            index_path (str): Path to the index file.
-            split_audio (bool): Whether to split the audio for processing.
-            f0_autotune (bool): Whether to use F0 autotune.
-            clean_audio (bool): Whether to clean the audio.
-            clean_strength (float): Strength of the audio cleaning.
-            export_format (str): Format for exporting the audio.
-            f0_file (str): Path to the F0 file.
-            embedder_model (str): Path to the embedder model.
-            embedder_model_custom (str): Path to the custom embedder model.
-            resample_sr (int, optional): Resample sampling rate. Default is 0.
-            sid (int, optional): Speaker ID. Default is 0.
-            **kwargs: Additional keyword arguments.
-        """
         if not model_path:
             print("No model path provided. Aborting conversion.")
             return
 
         self.get_vc(model_path, sid)
+        
+        temp_index_path = None
+        final_index_path = index_path
 
         try:
             start_time = time.time()
             print(f"Converting audio '{audio_input_path}'...")
+
+            # Handle index from .uvcp file
+            if self.serialized_index_data:
+                with tempfile.NamedTemporaryFile(delete=False, suffix=".index") as fp:
+                    index = faiss.deserialize_index(self.serialized_index_data)
+                    faiss.write_index(index, fp.name)
+                    temp_index_path = fp.name
+                    final_index_path = temp_index_path
 
             audio = load_audio_infer(
                 audio_input_path,
@@ -270,12 +257,13 @@ class VoiceConverter:
                 self.last_embedder_model = embedder_model
 
             file_index = (
-                index_path.strip()
+                final_index_path.strip()
                 .strip('"')
                 .strip("\n")
                 .strip('"')
                 .strip()
                 .replace("trained", "added")
+                if final_index_path and os.path.exists(final_index_path) else ""
             )
 
             if self.tgt_sr != resample_sr >= 16000:
@@ -285,8 +273,7 @@ class VoiceConverter:
                 chunks, intervals = process_audio(audio, 16000)
                 print(f"Audio split into {len(chunks)} chunks for processing.")
             else:
-                chunks = []
-                chunks.append(audio)
+                chunks = [audio]
 
             converted_chunks = []
             for c in chunks:
@@ -347,6 +334,10 @@ class VoiceConverter:
         except Exception as error:
             print(f"An error occurred during audio conversion: {error}")
             print(traceback.format_exc())
+        finally:
+            # Clean up temporary index file if it was created
+            if temp_index_path and os.path.exists(temp_index_path):
+                os.remove(temp_index_path)
 
     def convert_audio_batch(
         self,
@@ -412,7 +403,8 @@ class VoiceConverter:
             print(f"An error occurred during audio batch conversion: {error}")
             print(traceback.format_exc())
         finally:
-            os.remove(os.path.join(now_dir, "assets", "infer_pid.txt"))
+            if os.path.exists(os.path.join(now_dir, "assets", "infer_pid.txt")):
+                os.remove(os.path.join(now_dir, "assets", "infer_pid.txt"))
 
     def get_vc(self, weight_root, sid):
         """
@@ -443,7 +435,8 @@ class VoiceConverter:
             self.hubert_model = self.net_g = self.n_spk = self.vc = self.tgt_sr = None
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
-
+        
+        self.serialized_index_data = None
         del self.net_g, self.cpt
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -451,16 +444,27 @@ class VoiceConverter:
 
     def load_model(self, weight_root):
         """
-        Loads the model weights from the specified path.
+        Loads the model weights from the specified path. Handles .pth and .uvcp files.
 
         Args:
             weight_root (str): Path to the model weights.
         """
-        self.cpt = (
-            torch.load(weight_root, map_location="cpu", weights_only=True)
-            if os.path.isfile(weight_root)
-            else None
-        )
+        self.cpt = None
+        self.serialized_index_data = None
+
+        if not os.path.isfile(weight_root):
+            print(f"Model file not found: {weight_root}")
+            return
+        
+        if weight_root.endswith(".uvcp"):
+            print(f"Loading .uvcp file: {weight_root}")
+            uvcp_data = torch.load(weight_root, map_location="cpu")
+            self.cpt = uvcp_data.get("model_state")
+            self.serialized_index_data = uvcp_data.get("index_data")
+        else:
+            print(f"Loading .pth file: {weight_root}")
+            self.cpt = torch.load(weight_root, map_location="cpu", weights_only=True)
+
 
     def setup_network(self):
         """
