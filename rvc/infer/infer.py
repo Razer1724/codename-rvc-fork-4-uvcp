@@ -221,6 +221,33 @@ class VoiceConverter:
         sid: int = 0,
         **kwargs,
     ):
+        """
+        Performs voice conversion on the input audio.
+
+        Args:
+            pitch (int): Key for F0 up-sampling.
+            filter_radius (float): Radius for filtering.
+            index_rate (float): Rate for index matching.
+            volume_envelope (int): RMS mix rate.
+            protect (float): Protection rate for certain audio segments.
+            hop_length (int): Hop length for audio processing.
+            f0_method (str): Method for F0 extraction.
+            audio_input_path (str): Path to the input audio file.
+            audio_output_path (str): Path to the output audio file.
+            model_path (str): Path to the voice conversion model.
+            index_path (str): Path to the index file.
+            split_audio (bool): Whether to split the audio for processing.
+            f0_autotune (bool): Whether to use F0 autotune.
+            clean_audio (bool): Whether to clean the audio.
+            clean_strength (float): Strength of the audio cleaning.
+            export_format (str): Format for exporting the audio.
+            f0_file (str): Path to the F0 file.
+            embedder_model (str): Path to the embedder model.
+            embedder_model_custom (str): Path to the custom embedder model.
+            resample_sr (int, optional): Resample sampling rate. Default is 0.
+            sid (int, optional): Speaker ID. Default is 0.
+            **kwargs: Additional keyword arguments.
+        """
         if not model_path:
             print("No model path provided. Aborting conversion.")
             return
