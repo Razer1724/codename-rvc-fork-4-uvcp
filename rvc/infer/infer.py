@@ -9,6 +9,7 @@ import traceback
 import numpy as np
 import soundfile as sf
 import noisereduce as nr
+import faiss
 from pedalboard import (
     Pedalboard,
     Chorus,
@@ -61,6 +62,7 @@ class VoiceConverter:
         self.n_spk = None  # Number of speakers in the model
         self.use_f0 = None  # Whether the model uses F0
         self.loaded_model = None
+        self.loaded_index = None # Holds the deserialized Faiss index
 
     def load_hubert(self, embedder_model: str, embedder_model_custom: str = None):
         """
@@ -250,7 +252,7 @@ class VoiceConverter:
             return
 
         self.get_vc(model_path, sid)
-
+        
         try:
             start_time = time.time()
             print(f"Converting audio '{audio_input_path}'...")
@@ -276,6 +278,7 @@ class VoiceConverter:
                 .strip('"')
                 .strip()
                 .replace("trained", "added")
+                if index_path and os.path.exists(index_path) else ""
             )
 
             if self.tgt_sr != resample_sr >= 16000:
@@ -285,8 +288,7 @@ class VoiceConverter:
                 chunks, intervals = process_audio(audio, 16000)
                 print(f"Audio split into {len(chunks)} chunks for processing.")
             else:
-                chunks = []
-                chunks.append(audio)
+                chunks = [audio]
 
             converted_chunks = []
             for c in chunks:
@@ -308,6 +310,7 @@ class VoiceConverter:
                     f0_autotune=f0_autotune,
                     f0_autotune_strength=f0_autotune_strength,
                     f0_file=f0_file,
+                    loaded_index=self.loaded_index,
                 )
                 converted_chunks.append(audio_opt)
                 if split_audio:
@@ -412,7 +415,8 @@ class VoiceConverter:
             print(f"An error occurred during audio batch conversion: {error}")
             print(traceback.format_exc())
         finally:
-            os.remove(os.path.join(now_dir, "assets", "infer_pid.txt"))
+            if os.path.exists(os.path.join(now_dir, "assets", "infer_pid.txt")):
+                os.remove(os.path.join(now_dir, "assets", "infer_pid.txt"))
 
     def get_vc(self, weight_root, sid):
         """
@@ -443,7 +447,8 @@ class VoiceConverter:
             self.hubert_model = self.net_g = self.n_spk = self.vc = self.tgt_sr = None
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
-
+        
+        self.loaded_index = None
         del self.net_g, self.cpt
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -451,16 +456,34 @@ class VoiceConverter:
 
     def load_model(self, weight_root):
         """
-        Loads the model weights from the specified path.
+        Loads the model weights from the specified path. Handles .pth and .uvcp files.
 
         Args:
             weight_root (str): Path to the model weights.
         """
-        self.cpt = (
-            torch.load(weight_root, map_location="cpu", weights_only=True)
-            if os.path.isfile(weight_root)
-            else None
-        )
+        self.cpt = None
+        self.loaded_index = None
+
+        if not os.path.isfile(weight_root):
+            print(f"Model file not found: {weight_root}")
+            return
+        
+        if weight_root.endswith(".uvcp"):
+            print(f"Loading .uvcp file: {weight_root}")
+            uvcp_data = torch.load(weight_root, map_location="cpu", weights_only=False)
+            self.cpt = uvcp_data.get("model_state")
+            serialized_index = uvcp_data.get("index_data")
+            if serialized_index is not None:
+                try:
+                    self.loaded_index = faiss.deserialize_index(serialized_index)
+                    print("Successfully loaded and deserialized index from .uvcp file.")
+                except Exception as e:
+                    print(f"Failed to deserialize index from .uvcp file: {e}")
+                    self.loaded_index = None
+        else:
+            print(f"Loading .pth file: {weight_root}")
+            self.cpt = torch.load(weight_root, map_location="cpu", weights_only=True)
+
 
     def setup_network(self):
         """
