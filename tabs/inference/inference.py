@@ -5,6 +5,9 @@ import shutil
 import datetime
 import json
 import torch
+import io
+import zstandard as zstd
+
 
 from core import (
     run_infer_script,
@@ -53,7 +56,7 @@ names = [
     for root, _, files in os.walk(model_root_relative, topdown=False)
     for file in files
     if (
-        file.endswith((".pth", ".onnx"))
+        file.endswith((".pth", ".onnx", ".uvcp"))
         and not (file.startswith("G_") or file.startswith("D_"))
     )
 ]
@@ -182,7 +185,7 @@ def change_choices(model):
         for root, _, files in os.walk(model_root_relative, topdown=False)
         for file in files
         if (
-            file.endswith((".pth", ".onnx"))
+            file.endswith((".pth", ".onnx", ".uvcp"))
             and not (file.startswith("G_") or file.startswith("D_"))
         )
     ]
@@ -279,6 +282,8 @@ def delete_outputs():
 
 
 def match_index(model_file_value):
+    if model_file_value and model_file_value.endswith(".uvcp"):
+        return ""
     if model_file_value:
         model_folder = os.path.dirname(model_file_value)
         model_name = os.path.basename(model_file_value)
@@ -333,18 +338,31 @@ def refresh_embedders_folders():
 
 
 def get_speakers_id(model):
-    if model:
-        try:
-            model_data = torch.load(os.path.join(now_dir, model), map_location="cpu", weights_only=True)
-            speakers_id = model_data.get("speakers_id")
-            if speakers_id:
-                return list(range(speakers_id))
-            else:
+    if not model or not os.path.exists(os.path.join(now_dir, model)):
+        return [0]
+    try:
+        if model.endswith(".uvcp"):
+            with open(os.path.join(now_dir, model), 'rb') as f_comp:
+                dctx = zstd.ZstdDecompressor()
+                with dctx.stream_reader(f_comp) as reader:
+                    decompressed_data = reader.read()
+            buffer = io.BytesIO(decompressed_data)
+            model_data = torch.load(buffer, map_location="cpu", weights_only=False)
+            
+            if "models" in model_data:
+                return sorted(list(model_data["models"].keys()))
+            else: # Backwards compatibility for single-model .uvcp
                 return [0]
-        except Exception as e:
-            print(f"Error loading model: {e}")
+        else:
+            model_data = torch.load(os.path.join(now_dir, model), map_location="cpu", weights_only=True)
+        
+        speakers_id = model_data.get("speakers_id")
+        if speakers_id:
+            return list(range(speakers_id))
+        else:
             return [0]
-    else:
+    except Exception as e:
+        print(f"Error loading model to get speaker IDs: {e}")
         return [0]
 
 
@@ -354,7 +372,7 @@ def inference_tab():
         with gr.Row():
             model_file = gr.Dropdown(
                 label="Voice Model",
-                info="Select the voice model used for inference.",
+                info="Select the voice model (.pth, .onnx, or .uvcp) used for inference.",
                 choices=sorted(names, key=lambda x: extract_model_and_epoch(x)),
                 interactive=True,
                 value=default_weight,
@@ -363,7 +381,7 @@ def inference_tab():
 
             index_file = gr.Dropdown(
                 label="Index File",
-                info="Select the index file used for inference.",
+                info="Select the index file. Disabled if a .uvcp model is selected.",
                 choices=get_indexes(),
                 value=match_index(default_weight) if default_weight else "",
                 interactive=True,
@@ -386,6 +404,12 @@ def inference_tab():
                 fn=lambda model_file_value: match_index(model_file_value),
                 inputs=[model_file],
                 outputs=[index_file],
+            )
+            
+            model_file.change(
+                fn=lambda model_path: gr.update(interactive=not model_path.endswith(".uvcp")),
+                inputs=[model_file],
+                outputs=[index_file]
             )
 
     # Single inference tab
