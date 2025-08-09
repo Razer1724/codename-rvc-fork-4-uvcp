@@ -9,6 +9,9 @@ import traceback
 import numpy as np
 import soundfile as sf
 import noisereduce as nr
+import faiss
+import zstandard as zstd
+import io
 from pedalboard import (
     Pedalboard,
     Chorus,
@@ -57,10 +60,12 @@ class VoiceConverter:
         self.net_g = None  # Generator network for voice conversion
         self.vc = None  # Voice conversion pipeline instance
         self.cpt = None  # Checkpoint for loading model weights
+        self.active_cpt = None # Active checkpoint for the selected speaker
         self.version = None  # Model version
         self.n_spk = None  # Number of speakers in the model
         self.use_f0 = None  # Whether the model uses F0
         self.loaded_model = None
+        self.loaded_index = None # Holds the deserialized Faiss index
 
     def load_hubert(self, embedder_model: str, embedder_model_custom: str = None):
         """
@@ -220,36 +225,17 @@ class VoiceConverter:
     ):
         """
         Performs voice conversion on the input audio.
-
-        Args:
-            pitch (int): Key for F0 up-sampling.
-            filter_radius (float): Radius for filtering.
-            index_rate (float): Rate for index matching.
-            volume_envelope (int): RMS mix rate.
-            protect (float): Protection rate for certain audio segments.
-            hop_length (int): Hop length for audio processing.
-            f0_method (str): Method for F0 extraction.
-            audio_input_path (str): Path to the input audio file.
-            audio_output_path (str): Path to the output audio file.
-            model_path (str): Path to the voice conversion model.
-            index_path (str): Path to the index file.
-            split_audio (bool): Whether to split the audio for processing.
-            f0_autotune (bool): Whether to use F0 autotune.
-            clean_audio (bool): Whether to clean the audio.
-            clean_strength (float): Strength of the audio cleaning.
-            export_format (str): Format for exporting the audio.
-            f0_file (str): Path to the F0 file.
-            embedder_model (str): Path to the embedder model.
-            embedder_model_custom (str): Path to the custom embedder model.
-            resample_sr (int, optional): Resample sampling rate. Default is 0.
-            sid (int, optional): Speaker ID. Default is 0.
-            **kwargs: Additional keyword arguments.
         """
         if not model_path:
             print("No model path provided. Aborting conversion.")
             return
 
         self.get_vc(model_path, sid)
+        
+        # FIX: Add a guard clause to ensure the model and VC pipeline were loaded.
+        if not self.vc:
+            print("Voice conversion pipeline not initialized. Check for model loading errors in the logs. Aborting conversion.")
+            return
 
         try:
             start_time = time.time()
@@ -276,6 +262,7 @@ class VoiceConverter:
                 .strip('"')
                 .strip()
                 .replace("trained", "added")
+                if index_path and os.path.exists(index_path) else ""
             )
 
             if self.tgt_sr != resample_sr >= 16000:
@@ -285,15 +272,14 @@ class VoiceConverter:
                 chunks, intervals = process_audio(audio, 16000)
                 print(f"Audio split into {len(chunks)} chunks for processing.")
             else:
-                chunks = []
-                chunks.append(audio)
+                chunks = [audio]
 
             converted_chunks = []
             for c in chunks:
                 audio_opt = self.vc.pipeline(
                     model=self.hubert_model,
                     net_g=self.net_g,
-                    sid=sid,
+                    sid=0, # SID is now 0 as we load a specific speaker model
                     audio=c,
                     pitch=pitch,
                     f0_method=f0_method,
@@ -308,6 +294,7 @@ class VoiceConverter:
                     f0_autotune=f0_autotune,
                     f0_autotune_strength=f0_autotune_strength,
                     f0_file=f0_file,
+                    loaded_index=self.loaded_index,
                 )
                 converted_chunks.append(audio_opt)
                 if split_audio:
@@ -356,13 +343,6 @@ class VoiceConverter:
     ):
         """
         Performs voice conversion on a batch of input audio files.
-
-        Args:
-            audio_input_paths (str): List of paths to the input audio files.
-            audio_output_path (str): Path to the output audio file.
-            resample_sr (int, optional): Resample sampling rate. Default is 0.
-            sid (int, optional): Speaker ID. Default is 0.
-            **kwargs: Additional keyword arguments.
         """
         pid = os.getpid()
         try:
@@ -412,27 +392,48 @@ class VoiceConverter:
             print(f"An error occurred during audio batch conversion: {error}")
             print(traceback.format_exc())
         finally:
-            os.remove(os.path.join(now_dir, "assets", "infer_pid.txt"))
+            if os.path.exists(os.path.join(now_dir, "assets", "infer_pid.txt")):
+                os.remove(os.path.join(now_dir, "assets", "infer_pid.txt"))
 
     def get_vc(self, weight_root, sid):
         """
         Loads the voice conversion model and sets up the pipeline.
-
-        Args:
-            weight_root (str): Path to the model weights.
-            sid (int): Speaker ID.
         """
         if sid == "" or sid == []:
             self.cleanup_model()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
+            return
 
         if not self.loaded_model or self.loaded_model != weight_root:
             self.load_model(weight_root)
-            if self.cpt is not None:
-                self.setup_network()
-                self.setup_vc_instance()
-            self.loaded_model = weight_root
+        
+        # Handle model selection from multi-model .uvcp files
+        if self.cpt and self.cpt.get("models"):
+            sid = int(sid)
+            if sid in self.cpt["models"]:
+                model_data = self.cpt["models"][sid]
+                self.active_cpt = model_data["model_state"]
+                
+                self.loaded_index = None
+                if "index_data" in model_data:
+                    try:
+                        self.loaded_index = faiss.deserialize_index(model_data["index_data"])
+                        print(f"Loaded index for speaker {sid} from .uvcp file.")
+                    except Exception as e:
+                        print(f"Failed to deserialize index for speaker {sid}: {e}")
+            else:
+                print(f"Speaker ID {sid} not found in the .uvcp file.")
+                self.cleanup_model()
+                return
+        else: # For .pth or single-model .uvcp
+            self.active_cpt = self.cpt
+
+        if self.active_cpt is not None:
+            self.setup_network()
+            self.setup_vc_instance()
+        self.loaded_model = weight_root
+
 
     def cleanup_model(self):
         """
@@ -443,54 +444,88 @@ class VoiceConverter:
             self.hubert_model = self.net_g = self.n_spk = self.vc = self.tgt_sr = None
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
-
-        del self.net_g, self.cpt
+        
+        self.loaded_index = None
+        del self.net_g, self.cpt, self.active_cpt
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         self.cpt = None
+        self.active_cpt = None
 
     def load_model(self, weight_root):
         """
-        Loads the model weights from the specified path.
-
-        Args:
-            weight_root (str): Path to the model weights.
+        Loads the model weights from the specified path. Handles .pth and .uvcp files.
         """
-        self.cpt = (
-            torch.load(weight_root, map_location="cpu", weights_only=True)
-            if os.path.isfile(weight_root)
-            else None
-        )
+        self.cpt = None
+        self.loaded_index = None
+
+        if not os.path.isfile(weight_root):
+            print(f"Model file not found: {weight_root}")
+            return
+        
+        if weight_root.endswith(".uvcp"):
+            print(f"Loading Zstandard-compressed .uvcp file: {weight_root}")
+            try:
+                with open(weight_root, 'rb') as f_comp:
+                    dctx = zstd.ZstdDecompressor()
+                    with dctx.stream_reader(f_comp) as reader:
+                        decompressed_data = reader.read()
+                
+                buffer = io.BytesIO(decompressed_data)
+                uvcp_data = torch.load(buffer, map_location="cpu", weights_only=False)
+
+                # Check for new multi-model format
+                if "models" in uvcp_data:
+                    self.cpt = uvcp_data
+                    print(f"Successfully loaded multi-model .uvcp with {len(uvcp_data['models'])} speakers.")
+                # Backward compatibility for old single-model format
+                else:
+                    self.cpt = uvcp_data.get("model_state")
+                    serialized_index = uvcp_data.get("index_data")
+                    if serialized_index is not None:
+                        try:
+                            self.loaded_index = faiss.deserialize_index(serialized_index)
+                            print("Successfully loaded and deserialized index from single-model .uvcp file.")
+                        except Exception as e:
+                            print(f"Failed to deserialize index from .uvcp file: {e}")
+            except Exception as e:
+                print(f"An error occurred loading the .uvcp file: {e}")
+                self.cpt = None
+
+        else:
+            print(f"Loading .pth file: {weight_root}")
+            self.cpt = torch.load(weight_root, map_location="cpu", weights_only=True)
+
 
     def setup_network(self):
         """
         Sets up the network configuration based on the loaded checkpoint.
         """
-        if self.cpt is not None:
-            self.tgt_sr = self.cpt["config"][-1]
-            self.cpt["config"][-3] = self.cpt["weight"]["emb_g.weight"].shape[0]
-            self.use_f0 = self.cpt.get("f0", 1)
+        if self.active_cpt is not None:
+            self.tgt_sr = self.active_cpt["config"][-1]
+            self.active_cpt["config"][-3] = self.active_cpt["weight"]["emb_g.weight"].shape[0]
+            self.use_f0 = self.active_cpt.get("f0", 1)
 
-            self.version = self.cpt.get("version", "v1")
+            self.version = self.active_cpt.get("version", "v1")
             self.text_enc_hidden_dim = 768 if self.version == "v2" else 256
-            self.vocoder = self.cpt.get("vocoder", "HiFi-GAN")
+            self.vocoder = self.active_cpt.get("vocoder", "HiFi-GAN")
 
             if debug_ringformer_config:
                 print("Config values:")
-                for i, value in enumerate(self.cpt["config"]):
+                for i, value in enumerate(self.active_cpt["config"]):
                     print(f"  [{i}] = {value}")
 
                 print("ringformer_istft values:")
-                for i, value in enumerate(self.cpt["ringformer_istft"]):
+                for i, value in enumerate(self.active_cpt["ringformer_istft"]):
                     print(f"  [{i}] = {value}")
 
             if self.vocoder == "RingFormer":
-                ringformer_istft = self.cpt.get("ringformer_istft", [None, None])
+                ringformer_istft = self.active_cpt.get("ringformer_istft", [None, None])
                 self.gen_istft_n_fft = ringformer_istft[0]
                 self.gen_istft_hop_size = ringformer_istft[1]
 
                 self.net_g = Synthesizer(
-                    *self.cpt["config"],
+                    *self.active_cpt["config"],
                     use_f0=self.use_f0,
                     gen_istft_n_fft=self.gen_istft_n_fft,
                     gen_istft_hop_size=self.gen_istft_hop_size,
@@ -499,14 +534,14 @@ class VoiceConverter:
                 )
             else:
                 self.net_g = Synthesizer(
-                    *self.cpt["config"],
+                    *self.active_cpt["config"],
                     use_f0=self.use_f0,
                     text_enc_hidden_dim=self.text_enc_hidden_dim,
                     vocoder=self.vocoder,
                 )
 
             del self.net_g.enc_q
-            self.net_g.load_state_dict(self.cpt["weight"], strict=False)
+            self.net_g.load_state_dict(self.active_cpt["weight"], strict=False)
             self.net_g = self.net_g.to(self.config.device).float()
             self.net_g.eval()
 
@@ -514,6 +549,6 @@ class VoiceConverter:
         """
         Sets up the voice conversion pipeline instance based on the target sampling rate and configuration.
         """
-        if self.cpt is not None:
+        if self.active_cpt is not None:
             self.vc = VC(self.tgt_sr, self.config)
-            self.n_spk = self.cpt["config"][-3]
+            self.n_spk = self.active_cpt["config"][-3]
